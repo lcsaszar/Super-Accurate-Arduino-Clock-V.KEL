@@ -1,25 +1,27 @@
+// Update:  modified for V.KEL VK2828U7G5LF GPS module and Philips RC5 IR transmitter
+// Commit Date: 03-June-2025
+// RTC always has UTC time and date
+// You have to set the GPS serial speed to 57600 with the u-blox u-center software,
+// or modify the speed to 9600 in the setup() section
 
 #include <Wire.h> //for RTC comms over I2C
 #include <SPI.h>  //for LED output to Max7219 module
+#include <RC5.h>  // add library from https://github.com/guyc/RC5
 
-//VERSION 7:  NANO PIN ASSIGNMENTS, adds simple count up timer, LED dimmer, shows GPS PPS status.
-// Commit Date: 23-June-2020
-// RTC always has UTC time and date
-
-//Nano pins: D10-D13, SPI for Max;  A3/D17(SQW), A4(SDA) and A5(SCL) for I2C to DS3231 RTC.
-//           D0,D1(serial) D2(PPS) for GPS. D3 for IR receiver interrupt.
+//Nano pins: D10/SS(CS), D11/DIN, D13/CLK = SPI for MAX7219;  D17/A3(SQW), D18/A4(SDA), D19/A5(SCL) = I2C to DS3231 RTC.
+//           D0/RX, D1/TX(not used), D2(PPS) = VK2828U7G5FL GPS. D3 = IR receiver interrupt.
 
 //STATE MACHINE SETUP//
   enum { DEBUG, BOOTUP, REG_OPS, TOGGLE_DISPLAY, COUNTER, CHECK_PPS, GPS_INIT, GPS_PPS_SYNC, GPS_NMEA_SYNC} StateMachine;
 
 //PIN DEFS & ADDRESSES//
-  const byte RTC_SQW_Pin = 17;  //same as A3 pin (using analog pin as digital for RTC SQW)
+  const byte RTC_SQW_Pin = 17;  //same as A3/D17 pin (using analog pin as digital for RTC SQW)
   const byte GPS_PPS_Pin = 2;   // for receiving the GPS PPS signal
-  const byte ir_pin = 3;    //Interrupt pin for IR receiver data pin.
-  const byte ChipSelectPin = 10;  // For Max7219. We set the SPI Chip Select/Slave Select Pin here. 10 for uno/nano. 53 for mega
-  
+  const byte irReceivePin = 3;    //Interrupt pin for IR receiver data pin.
+  const byte ChipSelectPin = 10;  // For Max7219. We set the SPI Chip Select/Slave Select Pin here. D10 for nano.
   const int RTC_I2C_ADDRESS = 0x68;  // Must be data type [int] to keep wire.h happy. Sets RTC DS3231 i2C address. 
-  
+
+RC5 rc5 = RC5(irReceivePin);
 
 //TIMERS AND EDGE DETECTORS//
   unsigned long GPS_INIT_t0, t0, t1, t2; //for timers
@@ -37,13 +39,13 @@
 //UTC offset handlers//  //ie, Time Zones and Daylight Savings (summer) Time //
   bool UTC_offset_enable = true; // False for UTC time. True for local time.
   
-  const char offsetStandardHr = -5; 
+  const char offsetStandardHr = 1; 
   const char offsetStandardMin = 0;
-  const char offsetDSTHr = -4; 
+  const char offsetDSTHr = 2; 
   const char offsetDSTMin = 0;
 
-  const byte startDST[4] = {2,0,3,2}; // {nth,day of week,month,hh} use [0..6] for [Sunday...Saturday]
-  const byte startStandard[4] = {1,0,11,2}; // {nth,day of week,month,hh} [0..6] for [Sunday...Saturday]
+  const byte startDST[4] = {5,0,3,2}; // {nth,day of week,month,hh} use [0..6] for [Sunday...Saturday]
+  const byte startStandard[4] = {5,0,10,3}; // {nth,day of week,month,hh} [0..6] for [Sunday...Saturday]
                                  // set n=5 for 5th or last. Assume DST starts/stops at 2am local time
  
   const byte days[] = {0,31,28,31,30,31,30,31,31,30,31,30,31}; // mapping days of the 12 months
@@ -64,27 +66,21 @@
 
 //GPS UTC date+time handlers//
   byte hhGPS, mmGPS, ssGPS, ddGPS, moGPS;
-  int yyyyGPS = 0; 
+  int yyGPS = currentCentury; 
   
   bool newGPS_dateAvail = false;
   bool newGPS_timeAvail = false;
   bool NMEA_processFlag = false;
-  bool GGA_msg = false;
+//  bool GGA_msg = false;
   bool RMC_msg = false;
-  bool ZDA_msg = false;
   bool msgStart = false;
   
   bool GPS_sec_primed = false;
   bool PPS_done = false;
          
   byte byteIndex = 0;
-
-
-// SONY REMOTE CONTROL HANDLERS //
-unsigned int IR_start_bit = 2000;         //Start bit threshold (Microseconds) 2408
-unsigned int IR_1 = 1000;                 //Binary 1 threshold (Microseconds) 1184-1240
-unsigned int IR_0 = 400;                  //Binary 0 threshold (Microseconds) 556-640
-unsigned int IR_timeout = 2700;
+  byte comma = 1;
+  byte dateIndex = 0;
 
 bool counter_enable = true;
 
@@ -97,8 +93,7 @@ ICSP BLOCK PINOUT
 
 7219 MODULE:  DIN          LOAD(CS)     CLK         (*n/a*)
 SPI:          MOSI         SS           SCK          MISO
-UNO/NANO:     11/ICSP-4    10           13/ICSP-3    12/ICSP-1
-MEGA:         51/ICSP-4    53           52/ICSP-3    50/ICSP-1
+NANO:         D11          D10          D13          D12
 * 
 [CS(SS) can actually be any unused PIN on the uController, but these
 are the typical conventions.]
@@ -133,8 +128,11 @@ are the typical conventions.]
   const byte S = 0b01011011;
   const byte T = 0b00001111;
   const byte U = 0b00011100;
-  const byte M, K, V, W, X 
-               = 0b00000000;
+  const byte M = 0b00000000;
+  const byte K = 0b00000000;
+  const byte V = 0b00000000;
+  const byte W = 0b00000000;
+  const byte X = 0b00000000;
   const byte Y = 0b00111011;
   const byte Z = 0b01101101;
 
@@ -175,7 +173,7 @@ are the typical conventions.]
     const byte reg_intensity = 0x0A; // min 0x00, max 0x0F... 16 duty-cycle options. 0x07 middle.
     const byte reg_scanlimit = 0x0B; // from 0x00 to 0x07 (sets number of digits being scanned)
     const byte reg_shutdown = 0x0C; // 0x00 shutdown mode, 0x01 normal ops
-    const byte reg_displaytest = 0X0F; // 0x00 normal ops, 0x01 display test mode
+    const byte reg_displaytest = 0x0F; // 0x00 normal ops, 0x01 display test mode
     
 void SPIwrite (byte reg_address, byte regdata) {  
     //Writes 2 bytes to SPI. This is optimized for Max7219 Comms.
@@ -201,30 +199,20 @@ void initializeMax7219() {
 
     //reset the Max by activating shutdown mode   
     SPIwrite(reg_shutdown,0x00); // 0x00 shutdown, 0x01 normal ops
-  
     //initialize each digit with known values
     setAllDigitsTo(hyphen);
-  
     //set intensity
-    SPIwrite(reg_intensity, 0x07); // min 0x00, max 0x0F... 16 duty-cycle options. 0x07 middle.
-  
+    SPIwrite(reg_intensity, 0x03); // min 0x00, max 0x0F... 16 duty-cycle options. 0x07 middle.
     //set scan limit
     SPIwrite(reg_scanlimit, 0x07); // from 0x00 to 0x07 (sets number of digits being scanned)
-    
     //set decode
     SPIwrite(reg_decode, 0b00000000); // built-in decode, from 0x00 [all off] to 0xFF [all on] (bit map toggles digits 1-8).
-
     //flash a display test
     SPIwrite(reg_displaytest, 0x01); // 0x00 normal ops, 0x01 display test mode
-    delay(100);
-
     //end the test
     SPIwrite(reg_displaytest, 0x00); // 0x00 normal ops, 0x01 display test mode
-    delay(100);
-
     //exit shutdown mode. resume normal ops
     SPIwrite(reg_shutdown,0x01); // 0x00 shutdown, 0x01 normal ops
-    delay (100);
     
 } //end of initializeMax7219
 
@@ -248,64 +236,20 @@ void ISR_pulse_detected() {
 } //end of ISR_pulse_detected()
 
 
-//**** SONY REMOTE ROUTINES  ****//
+//**** Philips/Marantz REMOTE ROUTINES  ****//
 
-void processSonyIR(int code) {  // Sony IR code processors
+void processIR(int code) {  // IR code processors
   
   static byte brightness = 0x07;
   
-  if (code == 0xCD15) {  // displays the date
+  if (code == 0x0B) {  // Display - displays the date
     displayRTCDate();
     StateMachine = TOGGLE_DISPLAY;
     t1 = millis(); //sets t1 for date display in TOGGLE_DISPLAY state machine
   } //end if
 
-  if (code == 0xCD61) {  // toggles UTC vs local time
+  if (code == 0x2D) {  // Open/Close - toggles UTC vs local time
     UTC_offset_enable = !UTC_offset_enable;
-  } //end if
-
-  if (code == 0xCD25) {  // Starts counter mode  
-    countSS = 0;  //we reset all the counter registers to 0
-    countMM = 0;
-    countHH = 0;
-    displayRTC_timeOnMax(countHH,countMM,countSS);
-    StateMachine = COUNTER;
-  } //end if
-
-  if (code == 0xCD52) {  // turns counter timer on and off
-    counter_enable = !counter_enable;
-  } //end if
-
-  if (code == 0xCD20) {  // Goes into REG_OPS (used to exit counter mode)
-    StateMachine = REG_OPS;
-  } //end if
-
-  if (code == 0xCD3D) {  // does a 4 second check displaying whether PPS signal is active
-    StateMachine = CHECK_PPS;
-    maxDisplay(P,P,S,blank,O,F,F,blank); // set this as default display. will be overwritten if PPS is active
-    t1 = millis(); //sets t1 for date display in CHECK_PPS state machine
-  } //end if
-
-  if (code == 0xCD76) {  // toggles through brightness levels
-    delay(160); // Sony IR transmits 3 signals w/ each button press. This delay avoids repeat commands here.    
-    switch (brightness) {
-      case 0x07: 
-        brightness = 0x0F;
-        break;
-      case 0x0F: 
-        brightness = 0x01;
-        break;
-      case 0x01: 
-        brightness = 0x07;
-        break;
-    } // end of switch
-    
-    SPIwrite(reg_intensity, brightness); // min 0x00, max 0x0F... 16 duty-cycle options. 0x07 middle.
-  
-  } //end if  
-
-
-  if (code == 0xCD10) {   // display status of local or UTC time
     if (UTC_offset_enable) {
       maxDisplay(L,O,C,A,L,blank,blank,blank);
     } //end if
@@ -315,57 +259,53 @@ void processSonyIR(int code) {  // Sony IR code processors
     StateMachine = TOGGLE_DISPLAY;
     t1 = millis(); //sets t1 for date display in TOGGLE_DISPLAY state machine  
   } //end if
-} //end processSonyIR()
 
-void SonyIR_analyzer() {  // see http://www.righto.com/2010/03/understanding-sony-ir-remote-codes-lirc.html
-  static bool startFlag = false;
-  static byte bitCount = 99; 
-  static bool valid = false;
-  static byte state = 0;  // {0 startup, 1 initial, 2 process}
-  
-  static unsigned int lastTime = 0;
-  static unsigned int delta = 0;
-  static unsigned int IRvalue = 0;  //could experiment with this being 16. might work fine.
-
-  delta = pulseChangeTime - lastTime;
-
-  pulseFlag = 0; // reset the global volatile that got us here
-
-  if (delta > IR_start_bit && delta < IR_timeout) { //we test for a startbit first
-     state = 1;
+  if (code == 0x35) {  // Play - starts counter mode  
+    countSS = 0;  //we reset all the counter registers to 0
+    countMM = 0;
+    countHH = 0;
+    displayRTC_timeOnMax(countHH,countMM,countSS);
+    StateMachine = COUNTER;
   } //end if
-  
-  switch (state) {
-    case 1: 
-      startFlag = true;
-      bitCount = 0;
-      valid = false; //  even is false, odd is true for bitCount
-      IRvalue = 0;
-      state = 2;
-      break; //end case 1
 
-    case 2:
-        if (startFlag && valid) {  //we have started, and valid bit -- ie, not a spacer.
-          bitCount++;
-          IRvalue = IRvalue | ( (delta > IR_1) << (bitCount - 1));
-          valid = !valid;
-          if (bitCount == 20) {   //bitfield full. Do final process on IRvalue.
-            processSonyIR(IRvalue);  //action we take with IRvalue.
-            startFlag = false;
-            IRvalue = 0;
-            state = 0;
-            bitCount = 99;
-          } //end if
-        } //end if
-        else if (startFlag && !valid) {
-          valid = !valid;
-        } //end elseif
-        break; //end case 2
-  }// end switch
+  if (code == 0x30) {  // Pause - turns counter timer on and off
+    counter_enable = !counter_enable;
+  } //end if
 
-  lastTime = pulseChangeTime;
-  
-} //end SonyIR_analyzer()
+  if (code == 0x36) {  // Stop - goes into REG_OPS (used to exit counter mode)
+    StateMachine = REG_OPS;
+  } //end if
+
+  if (code == 0x2B) {  // AMS - does a 4 second check displaying whether PPS signal is active
+    StateMachine = CHECK_PPS;
+    maxDisplay(P,P,S,blank,O,F,F,blank); // set this as default display. will be overwritten if PPS is active
+    t1 = millis(); //sets t1 for date display in CHECK_PPS state machine
+  } //end if
+
+  if ((code == 0x10) && (brightness < 0x0F)) {  // Vol Up - toggles through brightness levels
+    delay(250); // IR transmits 3 signals w/ each button press. This delay avoids repeat commands here.    
+    brightness++;
+    SPIwrite(reg_intensity, brightness); // min 0x00, max 0x0F... 16 duty-cycle options. 0x07 middle.
+  }  // end if
+
+  if ((code == 0x11) && (brightness > 0x01)) {  // Vol Up - toggles through brightness levels
+    delay(250); // IR transmits 3 signals w/ each button press. This delay avoids repeat commands here.    
+    brightness--;
+    SPIwrite(reg_intensity, brightness); // min 0x00, max 0x0F... 16 duty-cycle options. 0x07 middle.
+  }  // end if
+ 
+  if (code == 0x0F) {   // Recall - display status of local or UTC time
+    if (UTC_offset_enable) {
+      maxDisplay(L,O,C,A,L,blank,blank,blank);
+    } //end if
+    else {
+      maxDisplay(blank,U,T,C,blank,blank,blank,blank);
+    } //end else
+    StateMachine = TOGGLE_DISPLAY;
+    t1 = millis(); //sets t1 for date display in TOGGLE_DISPLAY state machine  
+  } //end if
+} //end processIR()
+
 
 
 //**** UNIVERSAL FUNCTIONS ****//
@@ -418,27 +358,28 @@ void processNMEA() {
   if (Serial.available() > 0) {  //do all of this only if byte ready to read
     inByte = Serial.read();
     byteIndex++;    // we only increment index if we read a byte
-  
+
+// sample RMC message (no fix): $GPRMC,163213.80,V,,,,,,,150625,,*16
+// sample RMC message (position fix): $GPRMC,163320.40,A,4731.59662,N,01906.19440,E,1.645,,150625,,*16
+
     switch (byteIndex) {
-      case 1 ... 3:
+      case 1 ... 3: //  $GP characters ignored
         break;
       case 4:
-         GGA_msg = (inByte == 'G');
          RMC_msg = (inByte == 'R');
-         ZDA_msg = (inByte == 'Z');
          break;
       case 5:
-         GGA_msg = (GGA_msg && inByte == 'G');
-         RMC_msg = (RMC_msg && inByte == 'M');
-         ZDA_msg = (ZDA_msg && inByte == 'D');
+         RMC_msg = (RMC_msg && (inByte == 'M'));
          break;
       case 6:
-         GGA_msg = (GGA_msg && inByte == 'A');
-         RMC_msg = (RMC_msg && inByte == 'C');
-         ZDA_msg = (ZDA_msg && inByte == 'A');
-         NMEA_processFlag = (GGA_msg || RMC_msg || ZDA_msg); // if we have any of these, we keep processing
+         RMC_msg = (RMC_msg && (inByte == 'C'));
+         NMEA_processFlag = RMC_msg; // if we have RMC, we keep processing. We don't process GGA message.
+         if(NMEA_processFlag)
+           {
+            comma = 0;   // start counting commas
+           }
          break;
-      case 7:
+      case 7:  // first comma in RMC
         break;
       case 8:   // hour tens
          hhGPS = (inByte - '0')*10;
@@ -459,52 +400,55 @@ void processNMEA() {
          ssGPS += (inByte - '0');  
          //**AT THIS POINT WE HAVE GPS TIME**// CAN ACTUALLY UPDATE RTC!
          newGPS_timeAvail = true;
-         NMEA_processFlag = ZDA_msg;  //if we have ZDA, this is true and we keep processing.
          break;
-      case 14 ... 17:  //** WILL NEED TO TUNE THIS TO ACTUAL OUTPUT OF NEO 6M
-         break;
-      case 18:    //day tens
-         ddGPS = (inByte - '0')*10;  
-         break;
-      case 19:    //day units
-         ddGPS += (inByte - '0');
-         break;
-      case 20:
-         break;
-      case 21:    //mo tens
-         moGPS = (inByte - '0')*10;
-         break;
-      case 22:    //mo units
-         moGPS += (inByte - '0');
-         break;
-      case 23:
-         break;
-      case 24:
-         yyyyGPS = (inByte - '0')*1000;
-         break;
-      case 25:
-         yyyyGPS += (inByte - '0')*100;
-         break;      
-      case 26:
-         yyyyGPS += (inByte - '0')*10;
-         break;      
-      case 27:
-         yyyyGPS += (inByte - '0');
-         newGPS_dateAvail = true;   //all date fields now read
-         NMEA_processFlag = false;  //and no need to process further
-         break;
-      default:
-         NMEA_processFlag = false;
-      
-    } //end switch byteIndex
+    default:
+        // comma count for RMC message
+        if (comma < 8) 
+          {
+            if (inByte == ',') comma++;
+            break;  
+          } else {
+            dateIndex++;
+          }
+        switch (dateIndex){
+          case 1:
+            if (inByte == ',') // if the first byte after the 8th comma is again comma, we stop processing
+              { 
+                NMEA_processFlag = false;
+                break;
+              } else {             // ddmmyy follows in the next 6 bytes
+            ddGPS = (inByte - '0')*10;  //day tens
+            break;
+              }
+          case 2:
+            ddGPS += (inByte - '0');   //day units
+            break;
+          case 3:
+            moGPS = (inByte - '0')*10;   //mo tens
+            break;
+          case 4:
+            moGPS += (inByte - '0');   //mo units
+            break;
+          case 5:
+            yyGPS = (inByte - '0')*10;   //yy tens, add to currentCentury
+            break;
+          case 6:
+            yyGPS += (inByte - '0');       //yy units
+            dateIndex = 0;
+            comma = 1;
+            newGPS_dateAvail = true;   //all date fields now read
+            RMC_msg = false;
+            NMEA_processFlag = false;  //and no need to process further
+            break;
+          default:
+            break;  // default dateIndex
+        }  // end switch dateIndex
+      break;  // default byteIndex
+    }//end switch byteIndex
   } //end if Serial available
 } //end of processNMEA
 
-/*                  //      123456789012345678901234567|||  [27] GPS unit gives 2 decimals on time
-                  //        $GPGGA,hhmmss.tt,...
-    //  /* $GPGGA, $GPRMC:  $GPRMC,hhmmss.tt,...
-    //     $GPZDA:          $GPZDA,hhmmss.tt,dd,mm,yyyy,...
-*/
+
 
 //**** UTC TIMEZONE OFFSET AND DST HANDLERS ****//
 
@@ -584,11 +528,11 @@ void getLocalTime(int y, byte mo, byte d, byte h, byte m) {
   // we first get a baseline offset
   // NOTE: int y is being passed as RTC's 2-digit date.
   
-  if (yyyyGPS == 0) {   // Converting RTC 2 digit date to 4 digit:
+  if (yyGPS == currentCentury) {   // Converting RTC 2 digit date to 4 digit:
     y += currentCentury;  // takes our 2-digit year and converts to 4 digit
   }
   else { // or if GPS signal available, we just use that
-    y = yyyyGPS; // uses GPS 4-digit year if available
+    y = yyGPS; // uses GPS 4-digit year if available
   }
   
   offsetAdj(y,mo,d,h,m,offsetStandardHr,offsetStandardMin);
@@ -740,12 +684,15 @@ void setRTC_Date(int yyyy, byte mo, byte dd) {
   Wire.write(dec2bcd(mo)); //set month. ignore century as don't have any use for that.
   Wire.write(dec2bcd(yyyy % 100)); //set year. sending the 2 LS digits only.  
   Wire.endTransmission();
-} //end of setRTC_Time()
+} //end of setRTC_Date()
 
 //****  STATE MACHINE **** //
 
 void RunStateMachine() {
   byte temp_buffer;
+  unsigned char toggle;
+  unsigned char address;
+  unsigned char command;
   
   switch (StateMachine) {
 
@@ -763,6 +710,7 @@ void RunStateMachine() {
  // ------------------------------    
 
     case BOOTUP:
+    
         sendRTC(0x0E,0x00); // enables the 1Hz pulse on RTC DS3231's SQW pin
         delay(50);
         temp_buffer = getSingleRTC(0x02); //get hour byte from addr 0x02. Bit 6: LOW (0) = 24 hr mode. HIGH (1) = 12 hr.
@@ -788,15 +736,18 @@ void RunStateMachine() {
    
         displayRTC();  //keep the trains running
         
-        if (mmRTC == 15 && ssRTC == 0) {  //every hour at minute 15, do a GPS_INIT check to prep for GPS-to-RTC time update
+        if (ssRTC == 00) {  //every minute at second 00, do a GPS_INIT check to prep for GPS-to-RTC time update
           GPS_INIT_t0 = millis(); //sets our timer to allow a timeout in the next state
           StateMachine = GPS_INIT; // >>>> State Change! <<<<//
           break;
         } //end if
         if (pulseFlag == 1) {
-          detachInterrupt(digitalPinToInterrupt(ir_pin)); //stop interrupt while we process
-          SonyIR_analyzer();
-          attachInterrupt(digitalPinToInterrupt(ir_pin), ISR_pulse_detected, CHANGE);
+          detachInterrupt(digitalPinToInterrupt(irReceivePin)); //stop interrupt while we process
+          if (rc5.read(&toggle, &address, &command))
+            {
+              processIR(command);
+            }
+          attachInterrupt(digitalPinToInterrupt(irReceivePin), ISR_pulse_detected, CHANGE);
         } // end if
         break;
         //end REG_OPS case
@@ -804,6 +755,7 @@ void RunStateMachine() {
  // ------------------------------    
 
     case TOGGLE_DISPLAY:  //holds the display before resuming regular ops
+    
         if (millis() - t1 < 3500) {
            break;
         }
@@ -817,11 +769,15 @@ void RunStateMachine() {
  // ------------------------------    
 
     case COUNTER:  //runs the counter
+    
         countUp();
         if (pulseFlag == 1) {
-          detachInterrupt(digitalPinToInterrupt(ir_pin)); //stop interrupt while we process
-          SonyIR_analyzer();
-          attachInterrupt(digitalPinToInterrupt(ir_pin), ISR_pulse_detected, CHANGE);
+          detachInterrupt(digitalPinToInterrupt(irReceivePin)); //stop interrupt while we process
+          if (rc5.read(&toggle, &address, &command))
+            {
+              processIR(command);
+            }
+          attachInterrupt(digitalPinToInterrupt(irReceivePin), ISR_pulse_detected, CHANGE);
         } // end if
         break;
           
@@ -845,6 +801,7 @@ void RunStateMachine() {
  // ------------------------------   
         
     case GPS_INIT:
+    
         displayRTC();  // keeps the trains running on the display!
      
        if (PPS_detect()) {  //means PPS is detected on the GPS unit
@@ -888,7 +845,7 @@ void RunStateMachine() {
         } //end if
         
         if (newGPS_dateAvail && PPS_done) {
-          setRTC_Date(yyyyGPS,moGPS,ddGPS);
+          setRTC_Date(yyGPS,moGPS,ddGPS);
           newGPS_dateAvail = false; //this completed the date and time update.
           PPS_done = false;
           StateMachine = REG_OPS; // >>>> State Change! <<<<//
@@ -904,9 +861,8 @@ void RunStateMachine() {
           if (Serial.available() > 0) {
             if (Serial.read() == '$') {  //start of NMEA message
                 NMEA_processFlag = true;  //we only want to start processing at beginning of message
-                GGA_msg = false;
+//                GGA_msg = false;
                 RMC_msg = false;
-                ZDA_msg = false;
                 byteIndex = 1;
             } //end if
           } //end if
@@ -932,7 +888,7 @@ void RunStateMachine() {
         } //end if
 
         if (newGPS_dateAvail) {
-          setRTC_Date(yyyyGPS,moGPS,ddGPS);
+          setRTC_Date(yyGPS,moGPS,ddGPS);
           newGPS_dateAvail = false; //this completed the date and time update.
           StateMachine = REG_OPS; // >>>> State Change! <<<<//
           break;
@@ -945,9 +901,8 @@ void RunStateMachine() {
           if (Serial.available() > 0) {
             if (Serial.read() == '$') {  //start of NMEA message
                 NMEA_processFlag = true;
-                GGA_msg = false;
+//                GGA_msg = false;
                 RMC_msg = false;
-                ZDA_msg = false;
                 byteIndex = 1;
             } //end if
           } //end if
@@ -977,27 +932,27 @@ void setup() {
       
   initializeMax7219();  //sets all startup parameters for Max7219 chip
 
-  delay(100);
+  delay(2000);
   
   pinMode(RTC_SQW_Pin, INPUT_PULLUP); // SQW is open drain on DS3231, so need internal pullup enabled.
   pinMode(GPS_PPS_Pin, INPUT);
-  pinMode(ir_pin, INPUT_PULLUP);
+  pinMode(irReceivePin, INPUT_PULLUP);
   
   Wire.setClock(400000);  //i2C 100kHz typical. 400kHz fast mode. DS3231 RTC supports fast mode.
   delay(100); //more stabilizing
   
-  Serial.begin(9600);  // for the GPS unit. Later set to Serial when debugging done.
+  Serial.begin(57600);  // for the GPS unit
   delay(100); //more stabilizing
+
+  pinMode(4, INPUT);
+  pinMode(5, OUTPUT);
   
-  attachInterrupt (digitalPinToInterrupt(ir_pin), ISR_pulse_detected, CHANGE); 
+  attachInterrupt (digitalPinToInterrupt(irReceivePin), ISR_pulse_detected, CHANGE); 
   
   StateMachine = BOOTUP;  //set the initial state
-
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
-
   RunStateMachine();
-
 }
